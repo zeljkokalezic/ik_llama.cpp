@@ -238,6 +238,7 @@ server:
          --metrics                enable prometheus compatible metrics endpoint (default: disabled)
          --no-slots               disables slots monitoring endpoint (default: enabled)
          --slot-save-path PATH    path to save slot kv cache (default: disabled)
+         --slot-persist-cache     save slot kv cache on graceful shutdown and restore it on next start (requires --slot-save-path)
          --chat-template JINJA_TEMPLATE
                                   set custom jinja chat template (default: template taken from model's metadata)
                                   only commonly used templates are accepted:

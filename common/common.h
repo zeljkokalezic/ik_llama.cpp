@@ -508,6 +508,7 @@ struct gpt_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    bool slot_persist_cache = false;
     std::string sql_save_file;
     std::string sqlite_zstd_ext_file;
 

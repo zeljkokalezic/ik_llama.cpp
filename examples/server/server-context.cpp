@@ -16,6 +16,7 @@
 #include <iostream>
 #include <regex>
 #include <exception>
+#include <cstdio>
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1, int32_t offset = 0) {
     if (pos_min == -1) {
@@ -2799,6 +2800,58 @@ static size_t save_server_tokens_to_file(const std::string & filename, const ser
     return pos;
 }
 
+static size_t save_server_prompt_to_file(const std::string & filename, const server_prompt & prompt) {
+    if (prompt.data.empty()) {
+        return 0;
+    }
+
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        return 0;
+    }
+
+    uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+
+    server_tokens tokens = prompt.tokens.clone();
+    uint32_t n_token_count = (uint32_t) tokens.size();
+    file.write(reinterpret_cast<const char *>(&n_token_count), sizeof(n_token_count));
+    file.write(reinterpret_cast<const char *>(tokens.data()), sizeof(llama_token) * n_token_count);
+    file.write(reinterpret_cast<const char *>(prompt.data.data()), prompt.data.size());
+
+    size_t pos = file.tellp();
+    file.close();
+    return pos;
+}
+
+static size_t save_server_prompt_to_file(const std::string & filename, const server_prompt & prompt, const std::vector<uint8_t> & data) {
+    if (data.empty()) {
+        return 0;
+    }
+
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        return 0;
+    }
+
+    uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+
+    server_tokens tokens = prompt.tokens.clone();
+    uint32_t n_token_count = (uint32_t) tokens.size();
+    file.write(reinterpret_cast<const char *>(&n_token_count), sizeof(n_token_count));
+    file.write(reinterpret_cast<const char *>(tokens.data()), sizeof(llama_token) * n_token_count);
+    file.write(reinterpret_cast<const char *>(data.data()), data.size());
+
+    size_t pos = file.tellp();
+    file.close();
+    return pos;
+}
+
 static size_t load_server_tokens_from_file(const std::string & filename,  server_tokens & tokens) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
@@ -2820,6 +2873,322 @@ static size_t load_server_tokens_from_file(const std::string & filename,  server
     tokens.from_json(token_json);
 
     return pos;
+}
+
+std::string server_context::slot_autosave_filename(int id_slot) {
+    return "autosave-slot-" + std::to_string(id_slot) + ".bin";
+}
+
+std::string server_context::prompt_cache_autosave_filename(size_t index) {
+    return "autosave-prompt-cache-" + std::to_string(index) + ".bin";
+}
+
+void server_context::delete_slot_save_files(const std::string & filepath) {
+    const std::vector<std::string> paths = {
+        filepath,
+        filepath + ".tokens.json",
+        filepath + ".checkpoints",
+    };
+
+    for (const std::string & path : paths) {
+        if (std::remove(path.c_str()) != 0) {
+            std::ifstream file(path, std::ios::binary);
+            if (file.good()) {
+                LOG_WARNING("failed to delete slot save file", {{"file", path}});
+            }
+        }
+    }
+}
+
+bool server_context::save_slot_to_file(server_slot & slot, const std::string & filename, const std::string & filepath, json & result) {
+    const size_t token_count = slot.cache_tokens.size();
+    const int64_t t_start = ggml_time_us();
+
+    const size_t tokens_written = save_server_tokens_to_file(filepath + ".tokens.json", slot.cache_tokens);
+    const size_t checkpoints_written = save_checkpoints_to_file(filepath + ".checkpoints", slot.server_cached_prompt.checkpoints);
+    const size_t state_written = llama_state_seq_save_file(ctx, filepath.c_str(), slot.id, slot.cache_tokens.data(), token_count);
+
+    const int64_t t_end = ggml_time_us();
+    const double t_save_ms = (t_end - t_start) / 1000.0;
+
+    result = json{
+        { "id_slot",   slot.id },
+        { "filename",  filename },
+        { "n_saved",   token_count },
+        { "n_written", state_written + tokens_written + checkpoints_written },
+        { "timings", {
+            { "save_ms", t_save_ms }
+        } }
+    };
+
+    return state_written > 0;
+}
+
+bool server_context::restore_slot_from_file(server_slot & slot, const std::string & filename, const std::string & filepath, json & result) {
+    const int64_t t_start = ggml_time_us();
+
+    slot.cache_tokens.resize(slot.n_ctx);
+    size_t token_count = 0;
+    const size_t state_read = llama_state_seq_load_file(ctx, filepath.c_str(), slot.id, slot.cache_tokens.data(), slot.cache_tokens.size(), &token_count);
+    if (state_read == 0) {
+        slot.cache_tokens.resize(0);
+        result = json{
+            { "id_slot",  slot.id },
+            { "filename", filename },
+            { "error",    "Unable to restore slot, no available space in KV cache or invalid slot save file" }
+        };
+        return false;
+    }
+
+    if (load_server_tokens_from_file(filepath + ".tokens.json", slot.cache_tokens) == 0) {
+        slot.cache_tokens.resize(token_count);
+    }
+    slot.server_cached_prompt.checkpoints.clear();
+    const size_t checkpoints_read = load_checkpoints_from_file(filepath + ".checkpoints", slot.server_cached_prompt.checkpoints);
+
+    const int64_t t_end = ggml_time_us();
+    const double t_restore_ms = (t_end - t_start) / 1000.0;
+
+    result = json{
+        { "id_slot",    slot.id },
+        { "filename",   filename },
+        { "n_restored", token_count },
+        { "n_read",     state_read + checkpoints_read },
+        { "timings", {
+            { "restore_ms", t_restore_ms }
+        } }
+    };
+
+    return true;
+}
+
+bool server_context::restore_prompt_cache_from_file(const std::string & filename, const std::string & filepath, json & result) {
+    if (!prompt_cache) {
+        result = json{
+            { "filename", filename },
+            { "error",    "prompt cache is disabled" }
+        };
+        return false;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    server_tokens tokens;
+    tokens.resize(n_ctx);
+    size_t token_count = 0;
+    const size_t state_read = llama_state_seq_load_file(ctx, filepath.c_str(), 0, tokens.data(), tokens.n_tokens(), &token_count);
+    if (state_read == 0) {
+        result = json{
+            { "filename", filename },
+            { "error",    "Unable to restore prompt cache, no available space in KV cache or invalid save file" }
+        };
+        return false;
+    }
+
+    if (load_server_tokens_from_file(filepath + ".tokens.json", tokens) == 0) {
+        tokens.resize(token_count);
+    }
+
+    std::list<server_prompt_checkpoint> checkpoints;
+    const size_t checkpoints_read = load_checkpoints_from_file(filepath + ".checkpoints", checkpoints);
+
+    const size_t state_size = llama_state_seq_get_size(ctx, 0, 0);
+    server_prompt prompt;
+    prompt.tokens = std::move(tokens);
+    prompt.pos_min = llama_kv_cache_seq_pos_min(ctx, 0);
+    prompt.pos_max = llama_kv_cache_seq_pos_max(ctx, 0);
+    prompt.checkpoints = std::move(checkpoints);
+    server_prompt * restored = prompt_cache->alloc(prompt, state_size);
+    if (restored == nullptr) {
+        result = json{
+            { "filename", filename },
+            { "error",    "Unable to allocate prompt cache state" }
+        };
+        llama_kv_cache_seq_rm(ctx, 0, -1, -1);
+        return false;
+    }
+
+    const size_t state_copied = llama_state_seq_get_data(ctx, restored->data.data(), restored->data.size(), 0, 0);
+    llama_kv_cache_seq_rm(ctx, 0, -1, -1);
+    if (state_copied != restored->data.size()) {
+        result = json{
+            { "filename", filename },
+            { "error",    "Unable to copy restored prompt cache state" }
+        };
+        prompt_cache->states.pop_back();
+        return false;
+    }
+
+    prompt_cache->update();
+
+    const int64_t t_end = ggml_time_us();
+    result = json{
+        { "filename",   filename },
+        { "n_restored", token_count },
+        { "n_read",     state_read + checkpoints_read },
+        { "source",     "prompt_cache" },
+        { "timings", {
+            { "restore_ms", (t_end - t_start) / 1000.0 }
+        } }
+    };
+
+    return true;
+}
+
+void server_context::restore_autosaved_slots() {
+    if (params_base.slot_save_path.empty()) {
+        return;
+    }
+
+    bool restored_any = false;
+
+    for (server_slot & slot : slots) {
+        const std::string filename = slot_autosave_filename(slot.id);
+        const std::string filepath = params_base.slot_save_path + filename;
+
+        {
+            std::ifstream file(filepath, std::ios::binary);
+            if (!file.good()) {
+                continue;
+            }
+        }
+
+        try {
+            json result;
+            const bool restored = restore_slot_from_file(slot, filename, filepath, result);
+            if (restored) {
+                restored_any = true;
+                LOG_INFO("autosaved slot kv cache restored", result);
+            } else {
+                LOG_WARNING("failed to restore autosaved slot kv cache", result);
+            }
+        } catch (const std::exception & e) {
+            LOG_WARNING("failed to restore autosaved slot kv cache", {
+                {"id_slot",  slot.id},
+                {"filename", filename},
+                {"error",    e.what()},
+            });
+        }
+        delete_slot_save_files(filepath);
+    }
+
+    for (size_t i = 0;; ++i) {
+        const std::string filename = prompt_cache_autosave_filename(i);
+        const std::string filepath = params_base.slot_save_path + filename;
+
+        {
+            std::ifstream file(filepath, std::ios::binary);
+            if (!file.good()) {
+                break;
+            }
+        }
+
+        try {
+            json result;
+            if (restore_prompt_cache_from_file(filename, filepath, result)) {
+                restored_any = true;
+                LOG_INFO("autosaved prompt cache restored", result);
+            } else {
+                LOG_WARNING("failed to restore autosaved prompt cache", result);
+            }
+        } catch (const std::exception & e) {
+            LOG_WARNING("failed to restore autosaved prompt cache", {
+                {"filename", filename},
+                {"error",    e.what()},
+            });
+        }
+        delete_slot_save_files(filepath);
+    }
+
+    if (restored_any) {
+        clean_kv_cache = false;
+    }
+}
+
+void server_context::save_autosaved_slots() {
+    if (params_base.slot_save_path.empty()) {
+        return;
+    }
+
+    for (server_slot & slot : slots) {
+        const std::string filename = slot_autosave_filename(slot.id);
+        const std::string filepath = params_base.slot_save_path + filename;
+        json result;
+        bool saved = false;
+
+        if (!slot.cache_tokens.empty() && llama_kv_cache_seq_pos_min(ctx, slot.id) >= 0) {
+            const int64_t t_start = ggml_time_us();
+            copy_data_to_cached_prompt(slot.cache_tokens, slot);
+            const size_t state_size = llama_state_seq_get_size(ctx, slot.id, 0);
+            std::vector<uint8_t> data(state_size);
+            const size_t state_copied = llama_state_seq_get_data(ctx, data.data(), data.size(), slot.id, 0);
+            const size_t state_written = state_copied == state_size
+                ? save_server_prompt_to_file(filepath, slot.server_cached_prompt, data)
+                : 0;
+            const size_t tokens_written = save_server_tokens_to_file(filepath + ".tokens.json", slot.server_cached_prompt.tokens);
+            const size_t checkpoints_written = save_checkpoints_to_file(filepath + ".checkpoints", slot.server_cached_prompt.checkpoints);
+            const int64_t t_end = ggml_time_us();
+
+            result = json{
+                { "id_slot",   slot.id },
+                { "filename",  filename },
+                { "n_saved",   slot.server_cached_prompt.n_tokens() },
+                { "n_written", state_written + tokens_written + checkpoints_written },
+                { "source",    "slot_state" },
+                { "timings", {
+                    { "save_ms", (t_end - t_start) / 1000.0 }
+                } }
+            };
+            saved = state_written > 0;
+        } else {
+            continue;
+        }
+
+        if (saved) {
+            LOG_INFO("autosaved slot kv cache", result);
+        } else {
+            LOG_WARNING("failed to autosave slot kv cache", result);
+        }
+    }
+
+    if (!prompt_cache) {
+        return;
+    }
+
+    size_t i = 0;
+    for (const server_prompt & state : prompt_cache->states) {
+        if (state.data.empty()) {
+            continue;
+        }
+
+        const std::string filename = prompt_cache_autosave_filename(i++);
+        const std::string filepath = params_base.slot_save_path + filename;
+        json result;
+
+        {
+            const int64_t t_start = ggml_time_us();
+            const size_t state_written = save_server_prompt_to_file(filepath, state);
+            const size_t tokens_written = save_server_tokens_to_file(filepath + ".tokens.json", state.tokens);
+            const size_t checkpoints_written = save_checkpoints_to_file(filepath + ".checkpoints", state.checkpoints);
+            const int64_t t_end = ggml_time_us();
+
+            result = json{
+                { "filename",  filename },
+                { "n_saved",   state.n_tokens() },
+                { "n_written", state_written + tokens_written + checkpoints_written },
+                { "source",    "prompt_cache" },
+                { "timings", {
+                    { "save_ms", (t_end - t_start) / 1000.0 }
+                } }
+            };
+
+            if (state_written > 0) {
+                LOG_INFO("autosaved prompt cache", result);
+            } else {
+                LOG_WARNING("failed to autosave prompt cache", result);
+            }
+        }
+    }
 }
 
 void server_context::process_single_task(server_task&& task) {
@@ -2981,32 +3350,16 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
 
-        const size_t token_count = slot->cache_tokens.size();
-        const int64_t t_start = ggml_time_us();
-
         std::string filename = task.data.at("filename");
         std::string filepath = task.data.at("filepath");
-        save_server_tokens_to_file(filepath+".tokens.json", slot->cache_tokens);
-        size_t saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
-
-        const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
-
-        const int64_t t_end = ggml_time_us();
-        const double t_save_ms = (t_end - t_start) / 1000.0;
+        json data;
+        save_slot_to_file(*slot, filename, filepath, data);
 
         server_task_result result;
         result.id = task.id;
         result.stop = true;
         result.error = false;
-        result.data = json{
-            { "id_slot",   id_slot },
-            { "filename",  filename },
-            { "n_saved",   token_count }, // tokens saved
-            { "n_written", nwrite + saved },      // bytes written
-            { "timings", {
-                { "save_ms", t_save_ms }
-            } }
-        };
+        result.data = data;
         queue_results.send(result);
     } break;
     case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -3023,38 +3376,19 @@ void server_context::process_single_task(server_task&& task) {
             queue_tasks.defer(std::move(task));
             break;
         }
-        const int64_t t_start = ggml_time_us();
-
         std::string filename = task.data.at("filename");
         std::string filepath = task.data.at("filepath");
-
-        slot->cache_tokens.resize(slot->n_ctx);
-        size_t token_count = 0;
-        size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
-        if (nread == 0) {
-            slot->cache_tokens.resize(0);
+        json data;
+        if (!restore_slot_from_file(*slot, filename, filepath, data)) {
             send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
-        load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
-        size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
-
-        const int64_t t_end = ggml_time_us();
-        const double t_restore_ms = (t_end - t_start) / 1000.0;
 
         server_task_result result;
         result.id = task.id;
         result.stop = true;
         result.error = false;
-        result.data = json{
-            { "id_slot",    id_slot },
-            { "filename",   filename },
-            { "n_restored", token_count }, // tokens restored
-            { "n_read",     nread },       // bytes read
-            { "timings", {
-                { "restore_ms", t_restore_ms }
-            } }
-        };
+        result.data = data;
         queue_results.send(result);
     } break;
     case SERVER_TASK_TYPE_SLOT_ERASE:
@@ -3475,6 +3809,9 @@ bool server_context::slots_idle(){
         if (all_idle) {
             LOG_INFO("all slots are idle", {});
             if (system_prompt.empty() && clean_kv_cache) {
+                if (params_base.slot_persist_cache) {
+                    save_autosaved_slots();
+                }
                 kv_cache_clear();
             }
             all_idle = true;

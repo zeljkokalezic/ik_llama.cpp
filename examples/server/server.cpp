@@ -31,6 +31,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <set>
 #include <mutex>
 #include <thread>
@@ -418,18 +419,15 @@ auto res_ok = [](httplib::Response& res, const json& data) {
     res.status = 200;
 };
 
-std::function<void(int)> shutdown_handler;
-std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+std::atomic<bool> shutdown_requested{false};
 
-inline void signal_handler(int signal) {
-    if (is_terminating.test_and_set()) {
+inline void signal_handler(int) {
+    bool was_requested = shutdown_requested.exchange(true);
+    if (was_requested) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
-        fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+        std::_Exit(1);
     }
-
-    shutdown_handler(signal);
 }
 
 static void log_prompt(const gpt_params & params_base, const json & body) {
@@ -452,6 +450,22 @@ int main(int argc, char ** argv) {
 
     // parse arguments from environment variables
     gpt_params_parse_from_env(params);
+
+    if (params.slot_persist_cache && params.slot_save_path.empty()) {
+        LOG_ERROR("--slot-persist-cache requires --slot-save-path", {});
+        return 1;
+    }
+    if (params.slot_persist_cache) {
+        std::error_code ec;
+        fs::create_directories(params.slot_save_path, ec);
+        if (ec) {
+            LOG_ERROR("failed to create slot save path", {
+                {"path", params.slot_save_path},
+                {"error", ec.message()},
+            });
+            return 1;
+        }
+    }
 
     // TODO: not great to use extern vars
     server_log_json = params.log_json;
@@ -588,6 +602,9 @@ int main(int argc, char ** argv) {
     } else {
         try {
             ctx_server.init();
+            if (params.slot_persist_cache) {
+                ctx_server.restore_autosaved_slots();
+            }
         } catch (const std::exception & e) {
             LOG_ERROR("server init failed", {{"error", e.what()}});
             state.store(SERVER_STATE_ERROR);
@@ -2146,10 +2163,6 @@ int main(int argc, char ** argv) {
         std::placeholders::_3
     ));
 
-    shutdown_handler = [&](int) {
-        ctx_server.queue_tasks.terminate();
-    };
-
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
@@ -2164,10 +2177,24 @@ int main(int argc, char ** argv) {
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
 
+    std::thread shutdown_thread([&ctx_server]() {
+        while (!shutdown_requested.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        ctx_server.queue_tasks.terminate();
+    });
+
     ctx_server.queue_tasks.start_loop();
+
+    shutdown_requested.store(true);
+    shutdown_thread.join();
 
     svr->stop();
     t.join();
+
+    if (params.slot_persist_cache) {
+        ctx_server.save_autosaved_slots();
+    }
 
     llama_backend_free();
 

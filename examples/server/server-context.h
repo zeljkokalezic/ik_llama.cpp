@@ -306,6 +306,16 @@ struct server_context {
 
     void init();
 
+    static std::string slot_autosave_filename(int id_slot);
+    static std::string prompt_cache_autosave_filename(size_t index);
+    static void delete_slot_save_files(const std::string & filepath);
+
+    bool save_slot_to_file(server_slot & slot, const std::string & filename, const std::string & filepath, json & result);
+    bool restore_slot_from_file(server_slot & slot, const std::string & filename, const std::string & filepath, json & result);
+    bool restore_prompt_cache_from_file(const std::string & filename, const std::string & filepath, json & result);
+    void save_autosaved_slots();
+    void restore_autosaved_slots();
+
     std::vector<llama_token> tokenize(const json& json_prompt, bool add_special) const;
 
     server_slot* get_slot_by_id(int id);
