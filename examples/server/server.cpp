@@ -419,15 +419,15 @@ auto res_ok = [](httplib::Response& res, const json& data) {
     res.status = 200;
 };
 
-std::atomic<bool> shutdown_requested{false};
+volatile std::sig_atomic_t shutdown_requested = 0;
 
 inline void signal_handler(int) {
-    bool was_requested = shutdown_requested.exchange(true);
-    if (was_requested) {
+    if (shutdown_requested) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
         std::_Exit(1);
     }
+    shutdown_requested = 1;
 }
 
 static void log_prompt(const gpt_params & params_base, const json & body) {
@@ -2178,15 +2178,16 @@ int main(int argc, char ** argv) {
 #endif
 
     std::thread shutdown_thread([&ctx_server]() {
-        while (!shutdown_requested.load()) {
+        while (!shutdown_requested) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        LOG_INFO("shutdown requested", {});
         ctx_server.queue_tasks.terminate();
     });
 
     ctx_server.queue_tasks.start_loop();
 
-    shutdown_requested.store(true);
+    shutdown_requested = 1;
     shutdown_thread.join();
 
     svr->stop();

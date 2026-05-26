@@ -3110,6 +3110,12 @@ void server_context::save_autosaved_slots() {
         return;
     }
 
+    LOG_INFO("autosave starting", {
+        {"slot_save_path", params_base.slot_save_path},
+        {"n_slots",        slots.size()},
+        {"n_prompt_cache", prompt_cache ? prompt_cache->states.size() : 0},
+    });
+
     for (server_slot & slot : slots) {
         const std::string filename = slot_autosave_filename(slot.id);
         const std::string filepath = params_base.slot_save_path + filename;
